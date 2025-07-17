@@ -5,6 +5,7 @@
 #include <Adafruit_BNO055.h>
 #include <arm_math.h>
 #include <TinyGPS++.h>
+#include <SoftwareSerial.h>
 
 // Sensor objects
 TinyGPSPlus gps;
@@ -16,6 +17,13 @@ Adafruit_BNO055 bno = Adafruit_BNO055(55);
 // Teensy 4.0: Use Serial1 for GPS (pins 0-RX, 1-TX)
 #define gpsSerial Serial1
 static const uint32_t GPSBaud = 9600;
+
+// RFD900x Configuration
+#define RFD_RX_PIN 24    // Teensy 4.0 RX -> RFD900x TX
+#define RFD_TX_PIN 25    // Teensy 4.0 TX -> RFD900x RX
+#define RFD_BAUD 57600   // Standard baud rate
+
+SoftwareSerial rfdSerial(RFD_RX_PIN, RFD_TX_PIN);
 
 // Flight parameters
 #define FIRST_STAGE_ALTITUDE 4000    // Altitude threshold for first stage separation (m)
@@ -75,6 +83,22 @@ float P_data[4] = {1, 0, 0, 1};
 float Q_data[4] = {0.2, 0, 0, 0.2};
 float wm[sigmaCount], wc[sigmaCount]; // Weights
 
+// Telemetry Packet Structure (packed binary)
+#pragma pack(push, 1)
+struct TelemetryPacket {
+  uint32_t timestamp;     // 4 bytes
+  float altitude;         // 4
+  float velocity;         // 4  
+  float acceleration_z;   // 4
+  float latitude;         // 4
+  float longitude;        // 4
+  uint16_t state : 4;     // 4 bits
+  uint16_t chutes : 2;    // 2 bits (bit0: drogue, bit1: main)
+  uint16_t stages : 2;    // 2 bits (bit0: stage1 sep, bit1: stage2 ign)
+  uint16_t checksum;      // 2 bytes
+};
+#pragma pack(pop)
+
 void setup() {
   Serial.begin(115200);
   while (!Serial);
@@ -126,6 +150,19 @@ void setup() {
   delay(1000);
   Serial.println("System initialized");
   digitalWrite(SYSTEM_READY_PIN, HIGH);
+
+  rfdSerial.begin(RFD_BAUD);
+  delay(1000);
+  
+  // Configure radio (optional)
+  rfdSerial.println("ATS3=5");   // Set network ID
+  delay(100);
+  rfdSerial.println("ATS6=20");  // 20dBm transmit power (100mW)
+  delay(100);
+  rfdSerial.println("AT&W");     // Save settings
+  delay(100);
+  
+  Serial.println("RFD900x Initialized");
 }
 
 void loop() {
@@ -172,6 +209,9 @@ void loop() {
 
   // Emergency checks
   emergencyProcedures(x_data[0], x_data[1]);
+
+  sendBinaryTelemetry();
+  handleRadioCommands();
 }
 
 // Sensor functions
@@ -499,4 +539,102 @@ void logSensorData(float usedAlt,float alt_bme,float alt_ms){
       Serial.print("GPS konumu geçersiz");
     }
     Serial.println();
+}
+
+void sendBinaryTelemetry() {
+  static uint32_t lastSend = 0;
+  if (millis() - lastSend < 100) return; // 10Hz update rate
+
+  TelemetryPacket packet;
+  packet.timestamp = millis();
+  packet.altitude = x_data[0];
+  packet.velocity = x_data[1];
+  packet.acceleration_z = acz;
+  
+  // GPS data (if available)
+  if (gps.location.isValid()) {
+    packet.latitude = gps.location.lat();
+    packet.longitude = gps.location.lng();
+  } else {
+    packet.latitude = 0.0f;
+    packet.longitude = 0.0f;
+  }
+  
+  // Pack status bits
+  packet.state = state & 0x0F;
+  packet.chutes = (parachute1 ? 0x01 : 0x00) | (parachute2 ? 0x02 : 0x00);
+  packet.stages = (firstStageSeparated ? 0x01 : 0x00) | (secondStageIgnited ? 0x02 : 0x00);
+
+  // Calculate checksum (simple XOR of all bytes)
+  uint8_t* bytes = (uint8_t*)&packet;
+  packet.checksum = 0;
+  for (size_t i = 0; i < sizeof(packet)-2; i++) {
+    packet.checksum ^= bytes[i];
+  }
+
+  // Send with framing bytes
+  rfdSerial.write(0xAA);  // Start byte
+  rfdSerial.write(bytes, sizeof(packet));
+  rfdSerial.write(0x55);  // End byte
+  
+  lastSend = millis();
+}
+
+void handleRadioCommands() {
+  static uint8_t cmdBuffer[32];
+  static uint8_t bufPos = 0;
+  
+  while (rfdSerial.available()) {
+    uint8_t c = rfdSerial.read();
+    
+    // Simple protocol: 0xBB [CMD] [DATA] 0xCC
+    if (bufPos == 0 && c != 0xBB) continue;
+    
+    cmdBuffer[bufPos++] = c;
+    
+    if (c == 0xCC && bufPos >= 4) { // Complete command
+      processCommand(cmdBuffer[1], cmdBuffer[2]);
+      bufPos = 0;
+    }
+    
+    if (bufPos >= sizeof(cmdBuffer)) bufPos = 0;
+  }
+}
+
+void processCommand(uint8_t cmd, uint8_t data) {
+  switch(cmd) {
+    case 0x01: // Emergency chute deploy
+      if (!parachute1) {
+        digitalWrite(DROGUE_CHUTE_PIN, HIGH);
+        parachute1 = true;
+        state = 7;
+      }
+      break;
+      
+    case 0x02: // Reset system (for testing)
+      if (data == 0x55) {
+        resetSystem();
+      }
+      break;
+  }
+}
+
+void resetSystem() {
+  // Reset all outputs
+  digitalWrite(SYSTEM_READY_PIN, LOW);
+  digitalWrite(LAUNCH_DETECT_PIN, LOW);
+  digitalWrite(FIRST_STAGE_SEP_PIN, LOW);
+  digitalWrite(SECOND_STAGE_IGNITE_PIN, LOW);
+  digitalWrite(DROGUE_CHUTE_PIN, LOW);
+  digitalWrite(MAIN_CHUTE_PIN, LOW);
+  
+  // Reset state variables
+  state = 1;
+  parachute1 = parachute2 = false;
+  firstStageSeparated = secondStageIgnited = false;
+  
+  // Reinitialize sensors
+  bno.begin();
+  ms5611.begin();
+  bme.begin(0x76);
 }
